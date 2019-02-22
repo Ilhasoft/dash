@@ -26,16 +26,23 @@ def send_invitation_email_task(invitation_id):
 
 
 @shared_task
-def trigger_org_task(task_name, queue="celery"):
+def trigger_org_task(task_name, task_key, queue="celery"):
     """
     Triggers the given org task to be run for all active orgs
     :param task_name: the full task name, e.g. 'myproj.myapp.tasks.do_stuff'
     :param queue: the name of the queue to send org sub-tasks to
     """
     active_orgs = apps.get_model("orgs", "Org").objects.filter(is_active=True)
+    r = get_redis_connection()
+
     for org in active_orgs:
-        sig = signature(task_name, args=[org.pk])
-        sig.apply_async(queue=queue)
+        key = TaskState.get_lock_key(org, task_key)
+
+        if r.get(key):
+            logger.warning("Skipping task %s for org #%d as it is still running" % (task_key, org.pk))
+        else:
+            sig = signature(task_name, args=[org.pk])
+            sig.apply_async(queue=queue)
 
     logger.info("Requested task '%s' for %d active orgs" % (task_name, len(active_orgs)))
 
@@ -66,50 +73,46 @@ def maybe_run_for_org(org, task_func, task_key, lock_timeout):
     :param lock_timeout: the lock timeout in seconds
     """
     r = get_redis_connection()
-
     key = TaskState.get_lock_key(org, task_key)
 
-    if r.get(key):
-        logger.warning("Skipping task %s for org #%d as it is still running" % (task_key, org.id))
-    else:
-        with r.lock(key, timeout=lock_timeout):
-            state = org.get_task_state(task_key)
-            if state.is_disabled:
-                logger.info("Skipping task %s for org #%d as is marked disabled" % (task_key, org.id))
-                return
+    with r.lock(key, timeout=lock_timeout):
+        state = org.get_task_state(task_key)
+        if state.is_disabled:
+            logger.info("Skipping task %s for org #%d as is marked disabled" % (task_key, org.id))
+            return
 
-            logger.info("Started task %s for org #%d..." % (task_key, org.id))
+        logger.info("Started task %s for org #%d..." % (task_key, org.id))
 
-            prev_started_on = state.last_successfully_started_on
-            this_started_on = timezone.now()
+        prev_started_on = state.last_successfully_started_on
+        this_started_on = timezone.now()
 
-            state.started_on = this_started_on
-            state.ended_on = None
-            state.save(update_fields=("started_on", "ended_on"))
+        state.started_on = this_started_on
+        state.ended_on = None
+        state.save(update_fields=("started_on", "ended_on"))
 
-            num_task_args = len(inspect.getargspec(task_func).args)
+        num_task_args = len(inspect.getargspec(task_func).args)
 
-            try:
-                if num_task_args == 3:
-                    results = task_func(org, prev_started_on, this_started_on)
-                elif num_task_args == 1:
-                    results = task_func(org)
-                else:
-                    raise ValueError("Task signature must be foo(org) or foo(org, since, until)")  # pragma: no cover
+        try:
+            if num_task_args == 3:
+                results = task_func(org, prev_started_on, this_started_on)
+            elif num_task_args == 1:
+                results = task_func(org)
+            else:
+                raise ValueError("Task signature must be foo(org) or foo(org, since, until)")  # pragma: no cover
 
-                state.ended_on = timezone.now()
-                state.last_successfully_started_on = this_started_on
-                state.last_results = json.dumps(results)
-                state.is_failing = False
-                state.save(update_fields=("ended_on", "last_successfully_started_on", "last_results", "is_failing"))
+            state.ended_on = timezone.now()
+            state.last_successfully_started_on = this_started_on
+            state.last_results = json.dumps(results)
+            state.is_failing = False
+            state.save(update_fields=("ended_on", "last_successfully_started_on", "last_results", "is_failing"))
 
-                logger.info("Finished task %s for org #%d with result: %s" % (task_key, org.id, json.dumps(results)))
+            logger.info("Finished task %s for org #%d with result: %s" % (task_key, org.id, json.dumps(results)))
 
-            except Exception as e:
-                state.ended_on = timezone.now()
-                state.last_results = None
-                state.is_failing = True
-                state.save(update_fields=("ended_on", "last_results", "is_failing"))
+        except Exception as e:
+            state.ended_on = timezone.now()
+            state.last_results = None
+            state.is_failing = True
+            state.save(update_fields=("ended_on", "last_results", "is_failing"))
 
-                logger.exception("Task %s for org #%d failed" % (task_key, org.id))
-                raise e  # re-raise with original stack trace
+            logger.exception("Task %s for org #%d failed" % (task_key, org.id))
+            raise e  # re-raise with original stack trace
